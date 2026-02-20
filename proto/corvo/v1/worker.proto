@@ -1,0 +1,181 @@
+syntax = "proto3";
+
+package corvo.v1;
+
+option go_package = "github.com/corvohq/go-sdk/internal/gen/corvo/v1;corvov1";
+
+import "google/protobuf/timestamp.proto";
+
+service WorkerService {
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse) {}
+  rpc Fetch(FetchRequest) returns (FetchResponse) {}
+  rpc FetchBatch(FetchBatchRequest) returns (FetchBatchResponse) {}
+  rpc Ack(AckRequest) returns (AckResponse) {}
+  rpc AckBatch(AckBatchRequest) returns (AckBatchResponse) {}
+  rpc StreamLifecycle(stream LifecycleStreamRequest) returns (stream LifecycleStreamResponse) {}
+  rpc Fail(FailRequest) returns (FailResponse) {}
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
+}
+
+message EnqueueRequest {
+  string queue = 1;
+  string payload_json = 2;
+  AgentConfig agent = 3;
+}
+
+message EnqueueResponse {
+  string job_id = 1;
+  string status = 2;
+  bool unique_existing = 3;
+}
+
+message FetchRequest {
+  repeated string queues = 1;
+  string worker_id = 2;
+  string hostname = 3;
+  int32 lease_duration = 4;
+}
+
+message FetchResponse {
+  bool found = 1;
+  string job_id = 2;
+  string queue = 3;
+  string payload_json = 4;
+  int32 attempt = 5;
+  int32 max_retries = 6;
+  int32 lease_duration = 7;
+  string checkpoint_json = 8;
+  string tags_json = 9;
+  AgentState agent = 10;
+}
+
+message FetchBatchRequest {
+  repeated string queues = 1;
+  string worker_id = 2;
+  string hostname = 3;
+  int32 lease_duration = 4;
+  int32 count = 5;
+}
+
+message FetchBatchJob {
+  string job_id = 1;
+  string queue = 2;
+  string payload_json = 3;
+  int32 attempt = 4;
+  int32 max_retries = 5;
+  int32 lease_duration = 6;
+  string checkpoint_json = 7;
+  string tags_json = 8;
+  AgentState agent = 9;
+}
+
+message FetchBatchResponse {
+  repeated FetchBatchJob jobs = 1;
+}
+
+message UsageReport {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cache_creation_tokens = 3;
+  int64 cache_read_tokens = 4;
+  string model = 5;
+  string provider = 6;
+  double cost_usd = 7;
+}
+
+message AckRequest {
+  string job_id = 1;
+  string result_json = 2;
+  UsageReport usage = 3;
+  string checkpoint_json = 4;
+  string agent_status = 5;
+  string hold_reason = 6;
+  string trace_json = 7;
+}
+
+message AckResponse {}
+
+message AckBatchItem {
+  string job_id = 1;
+  string result_json = 2;
+  UsageReport usage = 3;
+}
+
+message AckBatchRequest {
+  repeated AckBatchItem items = 1;
+}
+
+message AckBatchResponse {
+  int32 acked = 1;
+}
+
+message LifecycleStreamRequest {
+  uint64 request_id = 1;
+  repeated string queues = 2;
+  string worker_id = 3;
+  string hostname = 4;
+  int32 lease_duration = 5;
+  int32 fetch_count = 6;
+  repeated AckBatchItem acks = 7;
+  repeated LifecycleEnqueueItem enqueues = 8;
+}
+
+message LifecycleEnqueueItem {
+  string queue = 1;
+  string payload_json = 2;
+  AgentConfig agent = 3;
+}
+
+message AgentConfig {
+  int32 max_iterations = 1;
+  double max_cost_usd = 2;
+  string iteration_timeout = 3;
+}
+
+message AgentState {
+  int32 max_iterations = 1;
+  double max_cost_usd = 2;
+  string iteration_timeout = 3;
+  int32 iteration = 4;
+  double total_cost_usd = 5;
+}
+
+message LifecycleStreamResponse {
+  uint64 request_id = 1;
+  repeated FetchBatchJob jobs = 2;
+  int32 acked = 3;
+  string error = 4;
+  repeated string enqueued_job_ids = 5;
+  string leader_addr = 6;  // HTTP URL of leader, set when error="NOT_LEADER"
+}
+
+message FailRequest {
+  string job_id = 1;
+  string error = 2;
+  string backtrace = 3;
+}
+
+message FailResponse {
+  string status = 1;
+  google.protobuf.Timestamp next_attempt_at = 2;
+  int32 attempts_remaining = 3;
+}
+
+message HeartbeatJobUpdate {
+  string progress_json = 1;
+  string checkpoint_json = 2;
+  UsageReport usage = 3;
+  string stream_delta = 4;
+}
+
+message HeartbeatRequest {
+  map<string, HeartbeatJobUpdate> jobs = 1;
+}
+
+message HeartbeatJobResponse {
+  string status = 1;
+}
+
+message HeartbeatResponse {
+  map<string, HeartbeatJobResponse> jobs = 1;
+}
