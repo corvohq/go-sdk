@@ -109,8 +109,13 @@ type authRoundTripper struct {
 	cfg  *config
 }
 
+const sdkName = "corvo-go"
+const sdkVersion = "0.2.0"
+
 func (a authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	cloned := req.Clone(req.Context())
+	cloned.Header.Set("x-corvo-client-name", sdkName)
+	cloned.Header.Set("x-corvo-client-version", sdkVersion)
 	for k, v := range a.cfg.headers {
 		cloned.Header.Set(k, v)
 	}
@@ -137,9 +142,6 @@ func (a authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func withAuthHTTPClient(httpClient *http.Client, cfg *config) *http.Client {
 	if httpClient == nil {
-		return httpClient
-	}
-	if len(cfg.headers) == 0 && cfg.bearerToken == "" && cfg.apiKey == "" && cfg.tokenSource == nil {
 		return httpClient
 	}
 	base := httpClient.Transport

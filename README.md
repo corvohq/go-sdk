@@ -8,6 +8,12 @@ Go client and worker runtime for [Corvo](https://corvo.dev), the fast job queue.
 go get github.com/corvohq/go-sdk
 ```
 
+## Compatibility
+
+| SDK Version | Corvo Server |
+|-------------|-------------|
+| 0.2.x       | >= 0.2.0    |
+
 ## Quick Start
 
 ### Client (REST HTTP)
