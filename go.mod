@@ -9,6 +9,6 @@ require (
 )
 
 require (
-	github.com/corvohq/proto v0.2.0
+	github.com/corvohq/proto v0.3.0
 	golang.org/x/text v0.33.0 // indirect
 )

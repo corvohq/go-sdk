@@ -110,7 +110,7 @@ type authRoundTripper struct {
 }
 
 const sdkName = "corvo-go"
-const sdkVersion = "0.2.0"
+const sdkVersion = "0.3.0"
 
 func (a authRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	cloned := req.Clone(req.Context())
