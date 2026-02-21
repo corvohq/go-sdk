@@ -457,6 +457,21 @@ func (c *Client) BulkStatus(id string) (*BulkTask, error) {
 	return &result, nil
 }
 
+// ServerInfo contains version information about the Corvo server.
+type ServerInfo struct {
+	ServerVersion string `json:"server_version"`
+	APIVersion    string `json:"api_version"`
+}
+
+// GetServerInfo returns version information about the Corvo server.
+func (c *Client) GetServerInfo() (*ServerInfo, error) {
+	var info ServerInfo
+	if err := c.get("/api/v1/info", &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
 // BulkGetJobs returns jobs for the given IDs. Missing jobs are skipped.
 func (c *Client) BulkGetJobs(ids []string) ([]*Job, error) {
 	var result struct {
