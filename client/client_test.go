@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func testServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
@@ -219,5 +220,97 @@ func TestServerTiming(t *testing.T) {
 	c.Enqueue("q", "payload")
 	if c.ServerDuration.Milliseconds() != 12 {
 		t.Fatalf("unexpected server duration: %v", c.ServerDuration)
+	}
+}
+
+func TestBulkGetJobs(t *testing.T) {
+	srv, c := testServer(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/jobs/bulk-get" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Method != "POST" {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+		ids := body["job_ids"].([]interface{})
+		if len(ids) != 2 {
+			t.Fatalf("expected 2 IDs, got %d", len(ids))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jobs": []interface{}{
+				map[string]interface{}{"id": "j1", "queue": "q", "state": "pending"},
+				map[string]interface{}{"id": "j2", "queue": "q", "state": "completed"},
+			},
+		})
+	})
+	defer srv.Close()
+
+	jobs, err := c.BulkGetJobs([]string{"j1", "j2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobs))
+	}
+	if jobs[0].ID != "j1" {
+		t.Fatalf("unexpected job[0].ID: %s", jobs[0].ID)
+	}
+}
+
+func TestSubscribe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/events" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		// Verify query params.
+		if q := r.URL.Query().Get("queues"); q != "build,deploy" {
+			t.Fatalf("unexpected queues param: %s", q)
+		}
+		if tp := r.URL.Query().Get("types"); tp != "progress" {
+			t.Fatalf("unexpected types param: %s", tp)
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("response writer doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		// Send two SSE events.
+		w.Write([]byte("id: 1\nevent: progress\ndata: {\"job_id\":\"j1\",\"current\":5}\n\n"))
+		flusher.Flush()
+		w.Write([]byte("id: 2\nevent: progress\ndata: {\"job_id\":\"j2\",\"current\":10}\n\n"))
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ch, err := c.Subscribe(ctx, SubscribeOptions{
+		Queues: []string{"build", "deploy"},
+		Types:  []string{"progress"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var events []Event
+	for ev := range ch {
+		events = append(events, ev)
+		if len(events) == 2 {
+			cancel()
+		}
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Type != "progress" {
+		t.Fatalf("event[0] type = %q, want %q", events[0].Type, "progress")
 	}
 }

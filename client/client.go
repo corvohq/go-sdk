@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -454,6 +455,116 @@ func (c *Client) BulkStatus(id string) (*BulkTask, error) {
 		return nil, err
 	}
 	return &result, nil
+}
+
+// BulkGetJobs returns jobs for the given IDs. Missing jobs are skipped.
+func (c *Client) BulkGetJobs(ids []string) ([]*Job, error) {
+	var result struct {
+		Jobs []*Job `json:"jobs"`
+	}
+	if err := c.post("/api/v1/jobs/bulk-get", map[string]interface{}{"job_ids": ids}, &result); err != nil {
+		return nil, err
+	}
+	return result.Jobs, nil
+}
+
+// Event is a lifecycle event from the SSE stream.
+type Event struct {
+	Type     string          `json:"type"`
+	Seq      uint64          `json:"seq"`
+	JobID    string          `json:"job_id,omitempty"`
+	Queue    string          `json:"queue,omitempty"`
+	AtNs     uint64          `json:"at_ns"`
+	Data     json.RawMessage `json:"data,omitempty"`
+}
+
+// SubscribeOptions configures the SSE event stream.
+type SubscribeOptions struct {
+	Queues      []string
+	JobIDs      []string
+	Types       []string
+	LastEventID uint64
+}
+
+// Subscribe opens an SSE event stream and sends events to the returned channel.
+// The channel is closed when the context is canceled or the stream ends.
+func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (<-chan Event, error) {
+	params := make([]string, 0)
+	if len(opts.Queues) > 0 {
+		params = append(params, "queues="+strings.Join(opts.Queues, ","))
+	}
+	if len(opts.JobIDs) > 0 {
+		params = append(params, "job_ids="+strings.Join(opts.JobIDs, ","))
+	}
+	if len(opts.Types) > 0 {
+		params = append(params, "types="+strings.Join(opts.Types, ","))
+	}
+	if opts.LastEventID > 0 {
+		params = append(params, "last_event_id="+strconv.FormatUint(opts.LastEventID, 10))
+	}
+
+	path := "/api/v1/events"
+	if len(params) > 0 {
+		path += "?" + strings.Join(params, "&")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.URL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.applyAuthHeaders(ctx, req); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("subscribe: HTTP %d", resp.StatusCode)
+	}
+
+	ch := make(chan Event, 64)
+	go func() {
+		defer close(ch)
+		defer func() { _ = resp.Body.Close() }()
+
+		scanner := bufio.NewScanner(resp.Body)
+		var eventType, eventID string
+		var dataLines []string
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				eventType = line[7:]
+			case strings.HasPrefix(line, "id: "):
+				eventID = line[4:]
+			case strings.HasPrefix(line, "data: "):
+				dataLines = append(dataLines, line[6:])
+			case line == "":
+				if len(dataLines) > 0 {
+					raw := strings.Join(dataLines, "\n")
+					var ev Event
+					if err := json.Unmarshal([]byte(raw), &ev); err == nil {
+						ev.Type = eventType
+						select {
+						case ch <- ev:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+				eventType = ""
+				eventID = ""
+				_ = eventID
+				dataLines = dataLines[:0]
+			}
+		}
+	}()
+
+	return ch, nil
 }
 
 // HTTP helpers
