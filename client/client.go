@@ -117,6 +117,17 @@ type AgentState struct {
 	TotalCostUSD     float64 `json:"total_cost_usd,omitempty"`
 }
 
+// UsageReport reports resource consumption for an agent iteration.
+type UsageReport struct {
+	InputTokens         int64   `json:"input_tokens,omitempty"`
+	OutputTokens        int64   `json:"output_tokens,omitempty"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens,omitempty"`
+	CacheReadTokens     int64   `json:"cache_read_tokens,omitempty"`
+	Model               string  `json:"model,omitempty"`
+	Provider            string  `json:"provider,omitempty"`
+	CostUSD             float64 `json:"cost_usd,omitempty"`
+}
+
 func WithPriority(p string) EnqueueOption {
 	return func(m map[string]interface{}) { m["priority"] = p }
 }
@@ -161,7 +172,7 @@ func WithAgent(cfg AgentConfig) EnqueueOption {
 // ChainConfig defines a job chain for sequential execution.
 type ChainConfig struct {
 	Steps     []ChainStep `json:"steps"`
-	OnFailure string      `json:"on_failure,omitempty"`
+	OnFailure *ChainStep  `json:"on_failure,omitempty"`
 	OnExit    *ChainStep  `json:"on_exit,omitempty"`
 }
 
@@ -171,7 +182,7 @@ type ChainStep struct {
 	Payload interface{} `json:"payload"`
 }
 
-func WithChain(steps []ChainStep, onFailure string, onExit *ChainStep) EnqueueOption {
+func WithChain(steps []ChainStep, onFailure *ChainStep, onExit *ChainStep) EnqueueOption {
 	return func(m map[string]interface{}) {
 		chain := ChainConfig{Steps: steps, OnFailure: onFailure, OnExit: onExit}
 		m["chain"] = chain
@@ -251,6 +262,8 @@ type Job struct {
 	Tags        json.RawMessage `json:"tags,omitempty"`
 	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
 	Agent       *AgentState     `json:"agent,omitempty"`
+	ChainID    string          `json:"chain_id,omitempty"`
+	ChainStep  *int            `json:"chain_step,omitempty"`
 	HoldReason  *string         `json:"hold_reason,omitempty"`
 	CreatedAt   string          `json:"created_at"`
 	StartedAt   *string         `json:"started_at,omitempty"`
@@ -361,8 +374,12 @@ func (c *Client) Fetch(ctx context.Context, queues []string, workerID, hostname 
 
 // AckBody is the request body for acknowledging a job.
 type AckBody struct {
-	Result     interface{} `json:"result,omitempty"`
-	StepStatus string      `json:"step_status,omitempty"`
+	Result      interface{}  `json:"result,omitempty"`
+	StepStatus  string       `json:"step_status,omitempty"`
+	AgentStatus string       `json:"agent_status,omitempty"`
+	HoldReason  string       `json:"hold_reason,omitempty"`
+	ExitReason  string       `json:"exit_reason,omitempty"`
+	Usage       *UsageReport `json:"usage,omitempty"`
 }
 
 // Ack acknowledges a job as complete.
@@ -677,6 +694,10 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 			return &PayloadTooLargeError{Message: apiErr.Error}
 		}
 		return fmt.Errorf("%s: %s", apiErr.Code, apiErr.Error)
+	}
+
+	if resp.StatusCode == http.StatusNoContent || len(data) == 0 {
+		return nil
 	}
 
 	if result != nil {
