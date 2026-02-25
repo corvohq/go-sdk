@@ -178,6 +178,10 @@ func WithChain(steps []ChainStep, onFailure string, onExit *ChainStep) EnqueueOp
 	}
 }
 
+func WithBatchID(id string) EnqueueOption {
+	return func(m map[string]interface{}) { m["batch_id"] = id }
+}
+
 // EnqueueResult is the response from enqueuing a job.
 type EnqueueResult struct {
 	JobID          string `json:"job_id"`
@@ -452,6 +456,38 @@ type BulkTask struct {
 func (c *Client) BulkStatus(id string) (*BulkTask, error) {
 	var result BulkTask
 	if err := c.get("/api/v1/bulk/"+id, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// CreateBatchResult is the response from creating a batch.
+type CreateBatchResult struct {
+	BatchID string `json:"batch_id"`
+}
+
+// CreateBatch creates a new open batch with the given callback queue.
+func (c *Client) CreateBatch(callbackQueue string, callbackPayload interface{}) (*CreateBatchResult, error) {
+	body := map[string]interface{}{"callback_queue": callbackQueue}
+	if callbackPayload != nil {
+		body["callback_payload"] = callbackPayload
+	}
+	var result CreateBatchResult
+	if err := c.post("/api/v1/batch", body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// SealBatchResult is the response from sealing a batch.
+type SealBatchResult struct {
+	Status string `json:"status"`
+}
+
+// SealBatch seals a batch so no more jobs can be added.
+func (c *Client) SealBatch(batchID string) (*SealBatchResult, error) {
+	var result SealBatchResult
+	if err := c.post("/api/v1/batch/"+batchID+"/seal", nil, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
