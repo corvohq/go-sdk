@@ -287,6 +287,8 @@ type SearchFilter struct {
 	Tags            map[string]string `json:"tags,omitempty"`
 	PayloadContains string            `json:"payload_contains,omitempty"`
 	ErrorContains   string            `json:"error_contains,omitempty"`
+	ChainID         string            `json:"chain_id,omitempty"`
+	BatchID         string            `json:"batch_id,omitempty"`
 	Sort            string            `json:"sort,omitempty"`
 	Order           string            `json:"order,omitempty"`
 	Limit           int               `json:"limit,omitempty"`
