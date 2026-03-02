@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,12 +29,19 @@ func IsPayloadTooLargeError(err error) bool {
 	return errors.As(err, &e)
 }
 
+// RetryConfig controls transient-error retry behavior.
+type RetryConfig struct {
+	MaxAttempts int           // default 3; 0 disables retry
+	BaseDelay   time.Duration // default 1s; jittered ±25%
+}
+
 // Client is a thin HTTP wrapper for the Corvo API.
 type Client struct {
 	URL            string
 	HTTPClient     *http.Client
 	ServerDuration time.Duration // last server-side processing duration from Server-Timing header
 	auth           authConfig
+	retry          RetryConfig
 }
 
 type TokenProvider func(ctx context.Context) (string, error)
@@ -81,6 +89,11 @@ func WithAPIKeyHeader(header, key string) ClientOption {
 	}
 }
 
+// WithRetry configures transient-error retry. Use MaxAttempts=0 to disable.
+func WithRetry(cfg RetryConfig) ClientOption {
+	return func(c *Client) { c.retry = cfg }
+}
+
 // New creates a new Corvo client.
 func New(url string) *Client {
 	return NewWithOptions(url)
@@ -93,6 +106,7 @@ func NewWithOptions(url string, opts ...ClientOption) *Client {
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		retry: RetryConfig{MaxAttempts: 3, BaseDelay: time.Second},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -656,56 +670,92 @@ func (c *Client) doRequest(method, path string, body interface{}, result interfa
 }
 
 func (c *Client) doRequestWithContext(ctx context.Context, method, path string, body interface{}, result interface{}) error {
-	var reader io.Reader
+	var bodyBytes []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("marshal body: %w", err)
 		}
-		reader = bytes.NewReader(b)
+		bodyBytes = b
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.URL+path, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if err := c.applyAuthHeaders(ctx, req); err != nil {
-		return err
+	attempts := 1
+	if c.retry.MaxAttempts > 0 {
+		attempts = c.retry.MaxAttempts
 	}
 
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	c.parseServerTiming(resp)
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode >= 400 {
-		var apiErr struct {
-			Error string `json:"error"`
-			Code  string `json:"code"`
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			jitter := 0.75 + rand.Float64()*0.5 // 0.75x–1.25x
+			delay := time.Duration(float64(c.retry.BaseDelay) * jitter)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
 		}
-		_ = json.Unmarshal(data, &apiErr)
-		if apiErr.Code == "PAYLOAD_TOO_LARGE" {
-			return &PayloadTooLargeError{Message: apiErr.Error}
-		}
-		return fmt.Errorf("%s: %s", apiErr.Code, apiErr.Error)
-	}
 
-	if resp.StatusCode == http.StatusNoContent || len(data) == 0 {
+		var reader io.Reader
+		if bodyBytes != nil {
+			reader = bytes.NewReader(bodyBytes)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, c.URL+path, reader)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if err := c.applyAuthHeaders(ctx, req); err != nil {
+			return err
+		}
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request failed: %w", err)
+			if attempt < attempts-1 {
+				continue // connection error — retry
+			}
+			return lastErr
+		}
+
+		data, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		c.parseServerTiming(resp)
+
+		if resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 429 {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			if attempt < attempts-1 {
+				continue // transient — retry
+			}
+			return lastErr
+		}
+
+		if resp.StatusCode >= 400 {
+			var apiErr struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			_ = json.Unmarshal(data, &apiErr)
+			if apiErr.Code == "PAYLOAD_TOO_LARGE" {
+				return &PayloadTooLargeError{Message: apiErr.Error}
+			}
+			return fmt.Errorf("%s: %s", apiErr.Code, apiErr.Error)
+		}
+
+		if resp.StatusCode == http.StatusNoContent || len(data) == 0 {
+			return nil
+		}
+
+		if result != nil {
+			return json.Unmarshal(data, result)
+		}
 		return nil
 	}
-
-	if result != nil {
-		return json.Unmarshal(data, result)
-	}
-	return nil
+	return lastErr
 }
 
 func (c *Client) applyAuthHeaders(ctx context.Context, req *http.Request) error {
