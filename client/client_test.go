@@ -30,8 +30,7 @@ func TestEnqueue(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"job_id": "job-1",
-			"status": "queued",
+			"job": map[string]interface{}{"id": "job-1", "queue": "default", "state": "pending"},
 		})
 	})
 	defer srv.Close()
@@ -42,6 +41,9 @@ func TestEnqueue(t *testing.T) {
 	}
 	if result.JobID != "job-1" {
 		t.Fatalf("unexpected job_id: %s", result.JobID)
+	}
+	if result.Job == nil || result.Job.ID != "job-1" {
+		t.Fatalf("unexpected job: %+v", result.Job)
 	}
 }
 
@@ -102,8 +104,8 @@ func TestFail(t *testing.T) {
 	srv, c := testServer(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "retry",
-			"attempt": 2,
+			"status":              "retrying",
+			"attempts_remaining":  1,
 		})
 	})
 	defer srv.Close()
@@ -112,8 +114,11 @@ func TestFail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Status != "retry" {
+	if result.Status != "retrying" {
 		t.Fatalf("unexpected status: %s", result.Status)
+	}
+	if result.AttemptsRemaining != 1 {
+		t.Fatalf("unexpected attempts_remaining: %d", result.AttemptsRemaining)
 	}
 }
 
@@ -121,9 +126,9 @@ func TestHeartbeat(t *testing.T) {
 	srv, c := testServer(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"acked":    []string{"job-1"},
-			"unknown":  []string{},
-			"canceled": []string{},
+			"jobs": map[string]interface{}{
+				"job-1": map[string]interface{}{"status": "ok"},
+			},
 		})
 	})
 	defer srv.Close()
@@ -132,8 +137,8 @@ func TestHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(result.Acked) != 1 || result.Acked[0] != "job-1" {
-		t.Fatalf("unexpected acked: %v", result.Acked)
+	if result.Jobs["job-1"].Status != "ok" {
+		t.Fatalf("unexpected status: %v", result.Jobs["job-1"].Status)
 	}
 }
 
@@ -160,7 +165,7 @@ func TestWithBearerToken(t *testing.T) {
 			t.Fatalf("unexpected auth header: %s", auth)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"job_id": "j1", "status": "queued"})
+		json.NewEncoder(w).Encode(map[string]interface{}{"job": map[string]interface{}{"id": "j1", "queue": "q", "state": "pending"}})
 	}))
 	defer srv.Close()
 
@@ -178,7 +183,7 @@ func TestWithAPIKey(t *testing.T) {
 			t.Fatalf("unexpected API key: %s", key)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"job_id": "j1", "status": "queued"})
+		json.NewEncoder(w).Encode(map[string]interface{}{"job": map[string]interface{}{"id": "j1", "queue": "q", "state": "pending"}})
 	}))
 	defer srv.Close()
 
@@ -213,7 +218,7 @@ func TestServerTiming(t *testing.T) {
 	srv, c := testServer(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server-Timing", "proc;dur=12.5")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"job_id": "j1", "status": "queued"})
+		json.NewEncoder(w).Encode(map[string]interface{}{"job": map[string]interface{}{"id": "j1", "queue": "q", "state": "pending"}})
 	})
 	defer srv.Close()
 

@@ -209,9 +209,25 @@ func WithBatchID(id string) EnqueueOption {
 
 // EnqueueResult is the response from enqueuing a job.
 type EnqueueResult struct {
-	JobID          string `json:"job_id"`
-	Status         string `json:"status"`
+	Job            *Job   `json:"job"`
+	JobID          string `json:"-"` // convenience; populated from Job.ID
 	UniqueExisting bool   `json:"unique_existing"`
+	UniqueJobID    string `json:"unique_job_id"`
+}
+
+func (r *EnqueueResult) UnmarshalJSON(data []byte) error {
+	type alias EnqueueResult
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*r = EnqueueResult(a)
+	if r.Job != nil {
+		r.JobID = r.Job.ID
+	} else if r.UniqueJobID != "" {
+		r.JobID = r.UniqueJobID
+	}
+	return nil
 }
 
 // Enqueue enqueues a job.
@@ -364,10 +380,15 @@ func (c *Client) MoveJob(id, targetQueue string) error {
 
 // FetchResult is a job returned by long-poll fetch.
 type FetchResult struct {
-	JobID   string          `json:"job_id"`
-	Queue   string          `json:"queue"`
-	Payload json.RawMessage `json:"payload"`
-	Attempt int             `json:"attempt"`
+	JobID         string          `json:"job_id"`
+	Queue         string          `json:"queue"`
+	Payload       json.RawMessage `json:"payload"`
+	Attempt       int             `json:"attempt"`
+	MaxRetries    int             `json:"max_retries"`
+	LeaseDuration int             `json:"lease_duration"`
+	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
+	Tags          json.RawMessage `json:"tags,omitempty"`
+	Agent         *AgentState     `json:"agent,omitempty"`
 }
 
 // Fetch long-polls for a job from the given queues.
@@ -405,8 +426,10 @@ func (c *Client) Ack(jobID string, body AckBody) error {
 
 // FailResult is the response from failing a job.
 type FailResult struct {
-	Status  string `json:"status"`
-	Attempt int    `json:"attempt"`
+	Job               *Job   `json:"job,omitempty"`
+	Status            string `json:"status"`
+	NextAttemptAt     string `json:"next_attempt_at,omitempty"`
+	AttemptsRemaining int    `json:"attempts_remaining"`
 }
 
 // Fail marks a job as failed.
@@ -425,11 +448,16 @@ type HeartbeatJob struct {
 	Checkpoint interface{} `json:"checkpoint,omitempty"`
 }
 
+// HeartbeatJobStatus is the per-job status in a heartbeat response.
+type HeartbeatJobStatus struct {
+	Status         string `json:"status"`
+	BudgetExceeded bool   `json:"budget_exceeded,omitempty"`
+}
+
 // HeartbeatResult is the response from a heartbeat.
 type HeartbeatResult struct {
-	Acked    []string `json:"acked"`
-	Unknown  []string `json:"unknown"`
-	Canceled []string `json:"canceled"`
+	Jobs           map[string]HeartbeatJobStatus `json:"jobs"`
+	LeaseExpiresAt string                        `json:"lease_expires_at"`
 }
 
 // Heartbeat sends a batched heartbeat for active jobs.
@@ -514,7 +542,7 @@ func (c *Client) CreateBatch(callbackQueue string, callbackPayload interface{}) 
 
 // SealBatchResult is the response from sealing a batch.
 type SealBatchResult struct {
-	Status string `json:"status"`
+	CallbackJob *Job `json:"callback_job,omitempty"`
 }
 
 // SealBatch seals a batch so no more jobs can be added.
