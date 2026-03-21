@@ -21,7 +21,6 @@ type FetchedJob struct {
 	LeaseDuration int             `json:"lease_duration"`
 	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
 	Tags          json.RawMessage `json:"tags,omitempty"`
-	Agent         *AgentState     `json:"agent,omitempty"`
 }
 
 // JobContext provides helper methods for the job handler.

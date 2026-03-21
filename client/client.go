@@ -29,6 +29,20 @@ func IsPayloadTooLargeError(err error) bool {
 	return errors.As(err, &e)
 }
 
+// UniqueConflictError is returned when enqueuing a job with a unique key that already exists (HTTP 409).
+type UniqueConflictError struct {
+	Message     string
+	UniqueJobID string
+}
+
+func (e *UniqueConflictError) Error() string { return e.Message }
+
+// IsUniqueConflictError reports whether err is a UniqueConflictError.
+func IsUniqueConflictError(err error) bool {
+	var e *UniqueConflictError
+	return errors.As(err, &e)
+}
+
 // RetryConfig controls transient-error retry behavior.
 type RetryConfig struct {
 	MaxAttempts int           // default 3; 0 disables retry
@@ -117,31 +131,6 @@ func NewWithOptions(url string, opts ...ClientOption) *Client {
 // EnqueueOption configures an enqueue request.
 type EnqueueOption func(map[string]interface{})
 
-type AgentConfig struct {
-	MaxIterations    int     `json:"max_iterations,omitempty"`
-	MaxCostUSD       float64 `json:"max_cost_usd,omitempty"`
-	IterationTimeout string  `json:"iteration_timeout,omitempty"`
-}
-
-type AgentState struct {
-	MaxIterations    int     `json:"max_iterations,omitempty"`
-	MaxCostUSD       float64 `json:"max_cost_usd,omitempty"`
-	IterationTimeout string  `json:"iteration_timeout,omitempty"`
-	Iteration        int     `json:"iteration,omitempty"`
-	TotalCostUSD     float64 `json:"total_cost_usd,omitempty"`
-}
-
-// UsageReport reports resource consumption for an agent iteration.
-type UsageReport struct {
-	InputTokens         int64   `json:"input_tokens,omitempty"`
-	OutputTokens        int64   `json:"output_tokens,omitempty"`
-	CacheCreationTokens int64   `json:"cache_creation_tokens,omitempty"`
-	CacheReadTokens     int64   `json:"cache_read_tokens,omitempty"`
-	Model               string  `json:"model,omitempty"`
-	Provider            string  `json:"provider,omitempty"`
-	CostUSD             float64 `json:"cost_usd,omitempty"`
-}
-
 func WithPriority(p string) EnqueueOption {
 	return func(m map[string]interface{}) { m["priority"] = p }
 }
@@ -177,10 +166,6 @@ func WithRetryBackoff(strategy, baseDelay, maxDelay string) EnqueueOption {
 		m["retry_base_delay"] = baseDelay
 		m["retry_max_delay"] = maxDelay
 	}
-}
-
-func WithAgent(cfg AgentConfig) EnqueueOption {
-	return func(m map[string]interface{}) { m["agent"] = cfg }
 }
 
 // ChainConfig defines a job chain for sequential execution.
@@ -291,7 +276,6 @@ type Job struct {
 	MaxRetries  int             `json:"max_retries"`
 	Tags        json.RawMessage `json:"tags,omitempty"`
 	Checkpoint  json.RawMessage `json:"checkpoint,omitempty"`
-	Agent       *AgentState     `json:"agent,omitempty"`
 	ChainID    string          `json:"chain_id,omitempty"`
 	ChainStep  *int            `json:"chain_step,omitempty"`
 	HoldReason  *string         `json:"hold_reason,omitempty"`
@@ -361,10 +345,6 @@ func (c *Client) ResumeQueue(name string) error {
 	return c.post("/api/v1/queues/"+name+"/resume", nil, nil)
 }
 
-func (c *Client) RetryJob(id string) error {
-	return c.post("/api/v1/jobs/"+id+"/retry", nil, nil)
-}
-
 func (c *Client) CancelJob(id string) error {
 	return c.post("/api/v1/jobs/"+id+"/cancel", nil, nil)
 }
@@ -388,7 +368,6 @@ type FetchResult struct {
 	LeaseDuration int             `json:"lease_duration"`
 	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
 	Tags          json.RawMessage `json:"tags,omitempty"`
-	Agent         *AgentState     `json:"agent,omitempty"`
 }
 
 // Fetch long-polls for a job from the given queues.
@@ -411,12 +390,10 @@ func (c *Client) Fetch(ctx context.Context, queues []string, workerID, hostname 
 
 // AckBody is the request body for acknowledging a job.
 type AckBody struct {
-	Result      interface{}  `json:"result,omitempty"`
-	StepStatus  string       `json:"step_status,omitempty"`
-	AgentStatus string       `json:"agent_status,omitempty"`
-	HoldReason  string       `json:"hold_reason,omitempty"`
-	ExitReason  string       `json:"exit_reason,omitempty"`
-	Usage       *UsageReport `json:"usage,omitempty"`
+	Result     interface{} `json:"result,omitempty"`
+	StepStatus string      `json:"step_status,omitempty"`
+	AckStatus  string      `json:"ack_status,omitempty"`
+	HoldReason string      `json:"hold_reason,omitempty"`
 }
 
 // Ack acknowledges a job as complete.
@@ -450,8 +427,7 @@ type HeartbeatJob struct {
 
 // HeartbeatJobStatus is the per-job status in a heartbeat response.
 type HeartbeatJobStatus struct {
-	Status         string `json:"status"`
-	BudgetExceeded bool   `json:"budget_exceeded,omitempty"`
+	Status string `json:"status"`
 }
 
 // HeartbeatResult is the response from a heartbeat.
@@ -764,12 +740,16 @@ func (c *Client) doRequestWithContext(ctx context.Context, method, path string, 
 
 		if resp.StatusCode >= 400 {
 			var apiErr struct {
-				Error string `json:"error"`
-				Code  string `json:"code"`
+				Error       string `json:"error"`
+				Code        string `json:"code"`
+				UniqueJobID string `json:"unique_job_id"`
 			}
 			_ = json.Unmarshal(data, &apiErr)
 			if apiErr.Code == "PAYLOAD_TOO_LARGE" {
 				return &PayloadTooLargeError{Message: apiErr.Error}
+			}
+			if resp.StatusCode == 409 {
+				return &UniqueConflictError{Message: apiErr.Error, UniqueJobID: apiErr.UniqueJobID}
 			}
 			return fmt.Errorf("%s: %s", apiErr.Code, apiErr.Error)
 		}
