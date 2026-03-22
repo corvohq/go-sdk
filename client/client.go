@@ -157,14 +157,14 @@ func WithTags(tags map[string]string) EnqueueOption {
 }
 
 func WithExpireAfter(d time.Duration) EnqueueOption {
-	return func(m map[string]interface{}) { m["expire_after"] = d.String() }
+	return func(m map[string]interface{}) { m["expire_after_ms"] = int64(d / time.Millisecond) }
 }
 
-func WithRetryBackoff(strategy, baseDelay, maxDelay string) EnqueueOption {
+func WithRetryBackoff(strategy string, baseDelay, maxDelay time.Duration) EnqueueOption {
 	return func(m map[string]interface{}) {
 		m["retry_backoff"] = strategy
-		m["retry_base_delay"] = baseDelay
-		m["retry_max_delay"] = maxDelay
+		m["retry_base_delay_ms"] = int64(baseDelay / time.Millisecond)
+		m["retry_max_delay_ms"] = int64(maxDelay / time.Millisecond)
 	}
 }
 
@@ -186,6 +186,10 @@ func WithChain(steps []ChainStep, onFailure *ChainStep, onExit *ChainStep) Enque
 		chain := ChainConfig{Steps: steps, OnFailure: onFailure, OnExit: onExit}
 		m["chain"] = chain
 	}
+}
+
+func WithGroup(group string) EnqueueOption {
+	return func(m map[string]interface{}) { m["group"] = group }
 }
 
 func WithBatchID(id string) EnqueueOption {
