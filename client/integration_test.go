@@ -143,7 +143,7 @@ func TestIntegrationFailAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fail failed: %v", err)
 	}
-	t.Logf("failed job, status=%s attempt=%d", failResult.Status, failResult.Attempt)
+	t.Logf("failed job, status=%s attempts_remaining=%d", failResult.Status, failResult.AttemptsRemaining)
 
 	time.Sleep(6 * time.Second)
 
@@ -205,6 +205,9 @@ func TestIntegrationWorker(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for job to be processed")
 	}
+
+	// Give the worker time to ack the job after processing.
+	time.Sleep(500 * time.Millisecond)
 
 	got, err := c.GetJob(result.JobID)
 	if err != nil {
