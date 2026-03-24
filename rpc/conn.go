@@ -444,7 +444,7 @@ func (c *Conn) Ping() error {
 //
 // Wire format:
 //
-//	[count:u16][now_ns:u64]
+//	[count:u16]
 //	per job: [queue:lenPrefixed][id:lenPrefixed][priority:u8][max_retries:u16]
 //	         [backoff:u8][base_delay_ms:u32][max_delay_ms:u32]
 //	         [unique_period_s:u32][scheduled_at_ns:u64][expire_after_ms:u32]
@@ -467,7 +467,7 @@ func (c *Conn) EnqueueBatch(jobs []EnqueueJob) (int, error) {
 	}
 
 	// Estimate payload size: header + per job fixed + optional fields.
-	estSize := 2 + 8 // count + now_ns
+	estSize := 2 // count
 	for i := range jobs {
 		j := &jobs[i]
 		// Fixed fields: queue(1+len) + id(1+len) + priority(1) + max_retries(2)
@@ -507,8 +507,6 @@ func (c *Conn) EnqueueBatch(jobs []EnqueueJob) (int, error) {
 
 	binary.LittleEndian.PutUint16(buf[off:], uint16(count))
 	off += 2
-	binary.LittleEndian.PutUint64(buf[off:], uint64(time.Now().UnixNano()))
-	off += 8
 
 	for i := range jobs {
 		j := &jobs[i]
@@ -616,7 +614,7 @@ func (c *Conn) EnqueueBatch(jobs []EnqueueJob) (int, error) {
 //
 // Wire format:
 //
-//	[now_ns:u64][count:u16][lease_ms:u32][worker_id:lenPrefixed][queue_count:u8][queues:lenPrefixed...]
+//	[count:u16][lease_ms:u32][worker_id:lenPrefixed][queue_count:u8][queues:lenPrefixed...]
 func (c *Conn) Subscribe(queues []string, workerID string, credits int) error {
 	if credits <= 0 {
 		credits = 1
@@ -632,7 +630,7 @@ func (c *Conn) Subscribe(queues []string, workerID string, credits int) error {
 	leaseMs := uint32(30000)
 
 	// Estimate payload size.
-	estSize := 8 + 2 + 4 + 1 + len(workerID) + 1
+	estSize := 2 + 4 + 1 + len(workerID) + 1
 	for _, q := range queues {
 		estSize += 1 + len(q)
 	}
@@ -640,8 +638,6 @@ func (c *Conn) Subscribe(queues []string, workerID string, credits int) error {
 	buf := make([]byte, estSize)
 	off := 0
 
-	binary.LittleEndian.PutUint64(buf[off:], uint64(time.Now().UnixNano()))
-	off += 8
 	binary.LittleEndian.PutUint16(buf[off:], uint16(credits))
 	off += 2
 	binary.LittleEndian.PutUint32(buf[off:], leaseMs)
@@ -804,7 +800,7 @@ func ackSectionSize(acks []AckJob) int {
 //
 // Wire format:
 //
-//	[now_ns:u64][count:u16]
+//	[count:u16]
 //	per ack: [job_id:lenPrefixed][queue:lenPrefixed][ack_status:u8][flags:u8]
 //	         if flags & 0x01: [result:lenPrefixed]
 //	         if flags & 0x02: [checkpoint:lenPrefixed]
@@ -818,13 +814,11 @@ func (c *Conn) AckBatch(acks []AckJob) error {
 		return fmt.Errorf("batch size %d exceeds u16 max", count)
 	}
 
-	estSize := 8 + 2 + ackSectionSize(acks)
+	estSize := 2 + ackSectionSize(acks)
 
 	buf := make([]byte, estSize)
 	off := 0
 
-	binary.LittleEndian.PutUint64(buf[off:], uint64(time.Now().UnixNano()))
-	off += 8
 	binary.LittleEndian.PutUint16(buf[off:], uint16(count))
 	off += 2
 
@@ -853,7 +847,7 @@ func (c *Conn) AckBatch(acks []AckJob) error {
 //
 // Wire format:
 //
-//	[now_ns:u64][count:u16]
+//	[count:u16]
 //	per job: [id:lenPrefixed][queue:lenPrefixed][error:lenPrefixed][backtrace:lenPrefixed]
 func (c *Conn) FailBatch(jobs []FailJob) error {
 	count := len(jobs)
@@ -865,7 +859,7 @@ func (c *Conn) FailBatch(jobs []FailJob) error {
 	}
 
 	// Estimate payload size.
-	estSize := 8 + 2 // now_ns + count
+	estSize := 2 // count
 	for i := range jobs {
 		j := &jobs[i]
 		estSize += 1 + len(j.JobID) + 1 + len(j.Queue) + 1 + len(j.Error) + 1 + len(j.Backtrace)
@@ -874,8 +868,6 @@ func (c *Conn) FailBatch(jobs []FailJob) error {
 	buf := make([]byte, estSize)
 	off := 0
 
-	binary.LittleEndian.PutUint64(buf[off:], uint64(time.Now().UnixNano()))
-	off += 8
 	binary.LittleEndian.PutUint16(buf[off:], uint16(count))
 	off += 2
 

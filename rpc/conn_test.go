@@ -103,9 +103,6 @@ func TestEnqueueBatch(t *testing.T) {
 			t.Errorf("expected count=2, got %d", count)
 		}
 
-		// Skip now_ns.
-		off += 8
-
 		// Read job 1: queue, id, priority, max_retries, backoff, base_delay_ms,
 		// max_delay_ms, unique_period_s, scheduled_at_ns, expire_after_ms,
 		// chain_step, flags.
@@ -189,7 +186,6 @@ func TestEnqueueBatchWithPayload(t *testing.T) {
 		if count != 1 {
 			t.Errorf("expected count=1, got %d", count)
 		}
-		off += 8 // skip now_ns
 
 		// queue, id
 		_, off = readLenPrefixed(payload, off)
@@ -246,8 +242,8 @@ func TestSubscribeAndReadPushedJobs(t *testing.T) {
 			t.Errorf("expected msgFetchBatch (0x%02x), got 0x%02x", msgFetchBatch, msgType)
 		}
 
-		// Parse request: now_ns(8) + count(2) + lease_ms(4) + worker_id(lenPrefixed) + queue_count(1) + queues.
-		off := 8 // skip now_ns
+		// Parse request: count(2) + lease_ms(4) + worker_id(lenPrefixed) + queue_count(1) + queues.
+		off := 0
 		credits := binary.LittleEndian.Uint16(payload[off:])
 		off += 2
 		if credits != 10 {
@@ -338,7 +334,7 @@ func TestAckBatch(t *testing.T) {
 			t.Errorf("expected msgAckBatch, got 0x%02x", msgType)
 		}
 
-		off := 8 // skip now_ns
+		off := 0
 		count := binary.LittleEndian.Uint16(payload[off:])
 		off += 2
 		if count != 2 {
@@ -404,7 +400,7 @@ func TestAckBatchWithOptionalFields(t *testing.T) {
 			t.Errorf("expected msgAckBatch, got 0x%02x", msgType)
 		}
 
-		off := 8 // skip now_ns
+		off := 0
 		count := binary.LittleEndian.Uint16(payload[off:])
 		off += 2
 		if count != 1 {
@@ -465,7 +461,6 @@ func TestFailBatch(t *testing.T) {
 		}
 
 		off := 0
-		off += 8 // skip now_ns
 		count := binary.LittleEndian.Uint16(payload[off:])
 		off += 2
 		if count != 1 {

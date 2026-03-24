@@ -80,8 +80,8 @@ func TestIntegrationEnqueueOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_job failed: %v", err)
 	}
-	if got.Priority != 1 {
-		t.Fatalf("expected priority=1 (high), got %d", got.Priority)
+	if got.Priority != 75 {
+		t.Fatalf("expected priority=75 (high), got %d", got.Priority)
 	}
 	if got.MaxRetries != 5 {
 		t.Fatalf("expected max_retries=5, got %d", got.MaxRetries)
