@@ -221,7 +221,7 @@ func (l *lane) flushEntries(entries []*enqueueEntry) {
 		JobIDs []string `json:"job_ids"`
 	}
 
-	err := l.client.post("/api/v1/enqueue/batch", body, &result)
+	err := l.client.post("/api/v1/enqueue", body, &result)
 	if err != nil {
 		for _, e := range entries {
 			e.err = err

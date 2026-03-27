@@ -263,7 +263,7 @@ type BatchResult struct {
 // EnqueueBatch enqueues multiple jobs.
 func (c *Client) EnqueueBatch(req BatchRequest) (*BatchResult, error) {
 	var result BatchResult
-	if err := c.post("/api/v1/enqueue/batch", req, &result); err != nil {
+	if err := c.post("/api/v1/enqueue", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
