@@ -23,6 +23,11 @@ const (
 	msgPing         = 0x04
 	msgHeartbeat    = 0x06
 	msgFailBatch    = 0x07
+	msgCancelSignal = 0x08 // Cancel signal (server -> client push).
+
+	// Bulk action request/response.
+	msgBulkAction     = 0x14
+	msgBulkActionResp = 0x94
 
 	// Response message types (request | 0x80).
 	msgEnqueueBatchResp = 0x81
@@ -110,6 +115,30 @@ type FetchedJob struct {
 	Tags       json.RawMessage
 	Payload    json.RawMessage
 }
+
+// Frame represents a message received from the server in the message loop.
+// Use ReadFrame to receive frames after calling Subscribe.
+type Frame struct {
+	Type FrameType
+	// Jobs is populated for FrameFetchResp.
+	Jobs []FetchedJob
+	// Affected is populated for FrameAckResp and FrameFailResp.
+	Affected int
+	// CancelledJobIDs is populated for FrameCancelSignal.
+	CancelledJobIDs []string
+}
+
+// FrameType identifies the kind of frame received.
+type FrameType int
+
+const (
+	FrameFetchResp    FrameType = iota // Pushed jobs from subscription
+	FrameAckResp                       // Ack confirmation
+	FrameFailResp                      // Fail confirmation
+	FrameCancelSignal                  // Server cancelled active jobs
+	FramePong                          // Pong response
+	FrameError                         // Server error
+)
 
 // Conn is a binary RPC connection to a Corvo server.
 // It is NOT safe for concurrent use; callers must synchronize externally
@@ -675,6 +704,155 @@ func (c *Conn) ReadPushedJobs() ([]FetchedJob, error) {
 	}
 
 	return parseFetchResponse(payload)
+}
+
+// ReadFrame reads the next frame from the server, dispatching by message type.
+// Use this in a message loop after Subscribe to handle interleaved
+// FETCH_RESP, ACK_RESP, FAIL_RESP, and CANCEL_SIGNAL frames.
+func (c *Conn) ReadFrame() (Frame, error) {
+	msgType, payload, err := c.readFrame()
+	if err != nil {
+		return Frame{}, err
+	}
+
+	switch msgType {
+	case msgFetchBatchResp:
+		jobs, err := parseFetchResponse(payload)
+		if err != nil {
+			return Frame{}, err
+		}
+		return Frame{Type: FrameFetchResp, Jobs: jobs}, nil
+
+	case msgAckBatchResp:
+		affected := 0
+		if len(payload) >= 2 {
+			affected = int(binary.LittleEndian.Uint16(payload[0:2]))
+		}
+		return Frame{Type: FrameAckResp, Affected: affected}, nil
+
+	case msgFailBatchResp:
+		affected := 0
+		if len(payload) >= 2 {
+			affected = int(binary.LittleEndian.Uint16(payload[0:2]))
+		}
+		return Frame{Type: FrameFailResp, Affected: affected}, nil
+
+	case msgCancelSignal:
+		var ids []string
+		if len(payload) >= 2 {
+			count := int(binary.LittleEndian.Uint16(payload[0:2]))
+			off := 2
+			for i := 0; i < count && off < len(payload); i++ {
+				id, newOff := readLenPrefixed(payload, off)
+				ids = append(ids, id)
+				off = newOff
+			}
+		}
+		return Frame{Type: FrameCancelSignal, CancelledJobIDs: ids}, nil
+
+	case msgPingResp:
+		return Frame{Type: FramePong}, nil
+
+	case msgError:
+		errMsg := "server error"
+		if len(payload) > 0 {
+			errMsg = string(payload)
+		}
+		return Frame{Type: FrameError}, &ServerError{Message: errMsg}
+
+	default:
+		return Frame{}, fmt.Errorf("unexpected message type 0x%02x", msgType)
+	}
+}
+
+// SendAck sends an ack batch without waiting for the response.
+// The response will arrive via ReadFrame as FrameAckResp.
+// Use this in a message loop with Subscribe for fire-and-forget acks.
+func (c *Conn) SendAck(acks []AckJob) error {
+	count := len(acks)
+	if count == 0 {
+		return nil
+	}
+
+	estSize := 2 + ackSectionSize(acks)
+	buf := make([]byte, estSize)
+	off := 0
+
+	binary.LittleEndian.PutUint16(buf[off:], uint16(count))
+	off += 2
+	off = encodeAckSection(buf, off, acks)
+
+	return c.sendOnly(msgAckBatch, buf[:off])
+}
+
+// SendFail sends a fail batch without waiting for the response.
+// The response will arrive via ReadFrame as FrameFailResp.
+func (c *Conn) SendFail(jobs []FailJob) error {
+	count := len(jobs)
+	if count == 0 {
+		return nil
+	}
+
+	estSize := 2
+	for i := range jobs {
+		j := &jobs[i]
+		estSize += 1 + len(j.JobID) + 1 + len(j.Queue) + 1 + len(j.Error) + 1 + len(j.Backtrace)
+	}
+
+	buf := make([]byte, estSize)
+	off := 0
+
+	binary.LittleEndian.PutUint16(buf[off:], uint16(count))
+	off += 2
+
+	for i := range jobs {
+		j := &jobs[i]
+		off = putLenPrefixed(buf, off, j.JobID)
+		off = putLenPrefixed(buf, off, j.Queue)
+		off = putLenPrefixed(buf, off, j.Error)
+		off = putLenPrefixed(buf, off, j.Backtrace)
+	}
+
+	return c.sendOnly(msgFailBatch, buf[:off])
+}
+
+// Cancel cancels jobs by ID via MSG_BULK_ACTION. Waits for server confirmation.
+// Returns the number of jobs cancelled.
+func (c *Conn) Cancel(jobIDs []string) (int, error) {
+	// Wire: [action:u8][queue:lenPrefixed][count:u16][{id:lenPrefixed}...][flags:u8][now_ns:u64]
+	estSize := 1 + 1 + 2 + 1 + 8 // action + empty queue + count + flags + now_ns
+	for _, id := range jobIDs {
+		estSize += 1 + len(id)
+	}
+
+	buf := make([]byte, estSize)
+	off := 0
+
+	buf[off] = 3 // BulkAction.cancel = 3
+	off++
+	off = putLenPrefixed(buf, off, "") // queue (empty)
+	binary.LittleEndian.PutUint16(buf[off:], uint16(len(jobIDs)))
+	off += 2
+	for _, id := range jobIDs {
+		off = putLenPrefixed(buf, off, id)
+	}
+	buf[off] = 0 // flags
+	off++
+	binary.LittleEndian.PutUint64(buf[off:], 0) // now_ns (server uses its own clock)
+	off += 8
+
+	respType, respPayload, err := c.sendAndRecv(msgBulkAction, buf[:off])
+	if err != nil {
+		return 0, err
+	}
+	if respType != msgBulkActionResp {
+		return 0, fmt.Errorf("unexpected response type 0x%02x for Cancel", respType)
+	}
+	if len(respPayload) < 2 {
+		return 0, nil
+	}
+	affected := int(binary.LittleEndian.Uint16(respPayload[0:2]))
+	return affected, nil
 }
 
 // parseFetchResponse decodes the fetch response wire format.

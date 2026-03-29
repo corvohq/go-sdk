@@ -27,6 +27,7 @@ type FetchedJob struct {
 type JobContext struct {
 	Job       FetchedJob
 	client    *Client
+	cancel    context.CancelFunc
 	cancelled bool
 	mu        sync.Mutex
 }
@@ -59,10 +60,15 @@ func (c *JobContext) setCancelled() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cancelled = true
+	if c.cancel != nil {
+		c.cancel()
+	}
 }
 
-// Handler processes a job. Return nil for success, error for failure.
-type Handler func(job FetchedJob, ctx *JobContext) error
+// Handler processes a job. The context is cancelled when the server cancels
+// the job — pass it to HTTP calls, DB queries, etc. to stop work immediately.
+// Return nil for success, error for failure.
+type Handler func(ctx context.Context, job FetchedJob, jctx *JobContext) error
 
 // Worker manages concurrent fetch loops and heartbeating.
 type Worker struct {
@@ -223,13 +229,15 @@ func (w *Worker) fetchLoop(fetchCtx context.Context) {
 			continue
 		}
 
-		jc := &JobContext{Job: *job, client: w.client}
+		jobCtx, jobCancel := context.WithCancel(fetchCtx)
+		jc := &JobContext{Job: *job, client: w.client, cancel: jobCancel}
 		w.mu.Lock()
 		w.activeJobs[job.JobID] = jc
 		w.mu.Unlock()
 
 		w.handlerWg.Add(1)
-		err = handler(*job, jc)
+		err = handler(jobCtx, *job, jc)
+		jobCancel()
 		w.handlerWg.Done()
 
 		w.mu.Lock()
