@@ -284,6 +284,8 @@ func TestSubscribeAndReadPushedJobs(t *testing.T) {
 		roff += 2
 		copy(resp[roff:], payloadBytes)
 		roff += len(payloadBytes)
+		binary.LittleEndian.PutUint64(resp[roff:], 0xDEADBEEF42) // lease_token
+		roff += 8
 
 		writeFrame(t, conn, msgFetchBatchResp, reqID, resp[:roff])
 	})
@@ -317,6 +319,9 @@ func TestSubscribeAndReadPushedJobs(t *testing.T) {
 	if jobs[0].MaxRetries != 3 {
 		t.Errorf("job.MaxRetries = %d, want 3", jobs[0].MaxRetries)
 	}
+	if jobs[0].LeaseToken != 0xDEADBEEF42 {
+		t.Errorf("job.LeaseToken = 0x%x, want 0xDEADBEEF42", jobs[0].LeaseToken)
+	}
 
 	var p map[string]string
 	if err := json.Unmarshal(jobs[0].Payload, &p); err != nil {
@@ -341,37 +346,48 @@ func TestAckBatch(t *testing.T) {
 			t.Errorf("ack count = %d, want 2", count)
 		}
 
+		// Ack 1.
 		id1, off := readLenPrefixed(payload, off)
 		q1, off := readLenPrefixed(payload, off)
 		status1 := payload[off]
 		off++
 		flags1 := payload[off]
 		off++
-
-		id2, off := readLenPrefixed(payload, off)
-		q2, off := readLenPrefixed(payload, off)
-		status2 := payload[off]
-		off++
-		flags2 := payload[off]
-		off++
-
 		if id1 != "j1" || q1 != "work" {
 			t.Errorf("ack1 data mismatch: id=%q queue=%q", id1, q1)
 		}
 		if status1 != AckDone {
 			t.Errorf("ack1 status = %d, want AckDone", status1)
 		}
-		if flags1 != 0 {
-			t.Errorf("ack1 flags = 0x%02x, want 0", flags1)
+		if flags1 != 0x08 {
+			t.Errorf("ack1 flags = 0x%02x, want 0x08", flags1)
 		}
+		lt1 := binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+		if lt1 != 0xABCD1234 {
+			t.Errorf("ack1 lease_token = 0x%x, want 0xABCD1234", lt1)
+		}
+
+		// Ack 2.
+		id2, off := readLenPrefixed(payload, off)
+		q2, off := readLenPrefixed(payload, off)
+		status2 := payload[off]
+		off++
+		flags2 := payload[off]
+		off++
 		if id2 != "j2" || q2 != "work" {
 			t.Errorf("ack2 data mismatch: id=%q queue=%q", id2, q2)
 		}
 		if status2 != AckDone {
 			t.Errorf("ack2 status = %d, want AckDone", status2)
 		}
-		if flags2 != 0 {
-			t.Errorf("ack2 flags = 0x%02x, want 0", flags2)
+		if flags2 != 0x08 {
+			t.Errorf("ack2 flags = 0x%02x, want 0x08", flags2)
+		}
+		lt2 := binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+		if lt2 != 0x5678EFAB {
+			t.Errorf("ack2 lease_token = 0x%x, want 0x5678EFAB", lt2)
 		}
 
 		resp := make([]byte, 3)
@@ -385,8 +401,8 @@ func TestAckBatch(t *testing.T) {
 	defer c.Close()
 
 	err := c.AckBatch([]AckJob{
-		{JobID: "j1", Queue: "work", AckStatus: AckDone},
-		{JobID: "j2", Queue: "work", AckStatus: AckDone},
+		{JobID: "j1", Queue: "work", AckStatus: AckDone, LeaseToken: 0xABCD1234},
+		{JobID: "j2", Queue: "work", AckStatus: AckDone, LeaseToken: 0x5678EFAB},
 	})
 	if err != nil {
 		t.Fatalf("AckBatch failed: %v", err)
@@ -420,8 +436,8 @@ func TestAckBatchWithOptionalFields(t *testing.T) {
 		if status != AckHold {
 			t.Errorf("ack status = %d, want AckHold", status)
 		}
-		if flags != 0x05 { // result + hold_reason
-			t.Errorf("ack flags = 0x%02x, want 0x05", flags)
+		if flags != 0x0D { // result(0x01) + hold_reason(0x04) + lease_token(0x08)
+			t.Errorf("ack flags = 0x%02x, want 0x0D", flags)
 		}
 
 		// Read result (flag 0x01).
@@ -430,9 +446,15 @@ func TestAckBatchWithOptionalFields(t *testing.T) {
 			t.Errorf("result = %q", result)
 		}
 		// Read hold_reason (flag 0x04).
-		holdReason, _ := readLenPrefixed(payload, off)
+		holdReason, off := readLenPrefixed(payload, off)
 		if holdReason != "needs review" {
 			t.Errorf("hold_reason = %q", holdReason)
+		}
+		// Read lease_token (flag 0x08).
+		lt := binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+		if lt != 0x999 {
+			t.Errorf("lease_token = 0x%x, want 0x999", lt)
 		}
 
 		resp := make([]byte, 3)
@@ -446,7 +468,7 @@ func TestAckBatchWithOptionalFields(t *testing.T) {
 	defer c.Close()
 
 	err := c.AckBatch([]AckJob{
-		{JobID: "j1", Queue: "work", AckStatus: AckHold, Result: `{"ok":true}`, HoldReason: "needs review"},
+		{JobID: "j1", Queue: "work", AckStatus: AckHold, Result: `{"ok":true}`, HoldReason: "needs review", LeaseToken: 0x999},
 	})
 	if err != nil {
 		t.Fatalf("AckBatch failed: %v", err)
@@ -470,10 +492,23 @@ func TestFailBatch(t *testing.T) {
 		id, off := readLenPrefixed(payload, off)
 		queue, off := readLenPrefixed(payload, off)
 		errMsg, off := readLenPrefixed(payload, off)
-		backtrace, _ := readLenPrefixed(payload, off)
+		backtrace, off := readLenPrefixed(payload, off)
 
 		if id != "j1" || queue != "work" || errMsg != "boom" || backtrace != "" {
 			t.Errorf("fail data: id=%q queue=%q err=%q bt=%q", id, queue, errMsg, backtrace)
+		}
+
+		// Read flags byte.
+		flags := payload[off]
+		off++
+		if flags != 0x01 {
+			t.Errorf("fail flags = 0x%02x, want 0x01", flags)
+		}
+		// Read lease_token.
+		lt := binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+		if lt != 0xFEED {
+			t.Errorf("fail lease_token = 0x%x, want 0xFEED", lt)
 		}
 
 		resp := make([]byte, 3)
@@ -487,7 +522,55 @@ func TestFailBatch(t *testing.T) {
 	defer c.Close()
 
 	err := c.FailBatch([]FailJob{
-		{JobID: "j1", Queue: "work", Error: "boom"},
+		{JobID: "j1", Queue: "work", Error: "boom", LeaseToken: 0xFEED},
+	})
+	if err != nil {
+		t.Fatalf("FailBatch failed: %v", err)
+	}
+}
+
+func TestFailBatchNoLeaseToken(t *testing.T) {
+	host, port, cleanup := mockServer(t, func(conn net.Conn) {
+		msgType, reqID, payload := readFrame(t, conn)
+		if msgType != msgFailBatch {
+			t.Errorf("expected msgFailBatch, got 0x%02x", msgType)
+		}
+
+		off := 0
+		count := binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		if count != 1 {
+			t.Errorf("fail count = %d, want 1", count)
+		}
+
+		id, off := readLenPrefixed(payload, off)
+		queue, off := readLenPrefixed(payload, off)
+		errMsg, off := readLenPrefixed(payload, off)
+		backtrace, off := readLenPrefixed(payload, off)
+
+		if id != "j1" || queue != "work" || errMsg != "oops" || backtrace != "" {
+			t.Errorf("fail data: id=%q queue=%q err=%q bt=%q", id, queue, errMsg, backtrace)
+		}
+
+		// Read flags byte — should be 0 (no lease_token).
+		flags := payload[off]
+		off++
+		if flags != 0 {
+			t.Errorf("fail flags = 0x%02x, want 0x00", flags)
+		}
+
+		resp := make([]byte, 3)
+		binary.LittleEndian.PutUint16(resp[0:], 1)
+		resp[2] = 0
+		writeFrame(t, conn, msgFailBatchResp, reqID, resp)
+	})
+	defer cleanup()
+
+	c := NewConn(host, port)
+	defer c.Close()
+
+	err := c.FailBatch([]FailJob{
+		{JobID: "j1", Queue: "work", Error: "oops"},
 	})
 	if err != nil {
 		t.Fatalf("FailBatch failed: %v", err)
@@ -662,6 +745,8 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	off += 2
 	copy(buf[off:], p1)
 	off += len(p1)
+	binary.LittleEndian.PutUint64(buf[off:], 111) // lease_token
+	off += 8
 
 	// Job 2.
 	off = putLenPrefixed(buf, off, "j2")
@@ -674,6 +759,8 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	off = putLenPrefixedBytes(buf, off, nil) // no tags
 	binary.LittleEndian.PutUint16(buf[off:], 0)  // no payload
 	off += 2
+	binary.LittleEndian.PutUint64(buf[off:], 222) // lease_token
+	off += 8
 
 	jobs, err := parseFetchResponse(buf[:off])
 	if err != nil {
@@ -699,6 +786,9 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	if string(jobs[0].Payload) != `{"action":"build"}` {
 		t.Errorf("job[0].Payload = %q", jobs[0].Payload)
 	}
+	if jobs[0].LeaseToken != 111 {
+		t.Errorf("job[0].LeaseToken = %d, want 111", jobs[0].LeaseToken)
+	}
 
 	// Job 2 checks.
 	if jobs[1].JobID != "j2" || jobs[1].Queue != "q2" {
@@ -712,5 +802,8 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	}
 	if jobs[1].Payload != nil {
 		t.Errorf("job[1].Payload should be nil, got %q", jobs[1].Payload)
+	}
+	if jobs[1].LeaseToken != 222 {
+		t.Errorf("job[1].LeaseToken = %d, want 222", jobs[1].LeaseToken)
 	}
 }

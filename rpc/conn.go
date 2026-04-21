@@ -87,6 +87,7 @@ type AckJob struct {
 	Result     string // optional
 	Checkpoint string // optional
 	HoldReason string // optional
+	LeaseToken uint64 // optional; sent when non-zero
 }
 
 // HeartbeatJob describes a heartbeat update for a single job.
@@ -99,10 +100,11 @@ type HeartbeatJob struct {
 
 // FailJob describes a job failure to report via the binary RPC protocol.
 type FailJob struct {
-	JobID     string
-	Queue     string
-	Error     string
-	Backtrace string
+	JobID      string
+	Queue      string
+	Error      string
+	Backtrace  string
+	LeaseToken uint64 // optional; sent when non-zero
 }
 
 // FetchedJob is a job returned from a fetch subscription push.
@@ -114,6 +116,7 @@ type FetchedJob struct {
 	Checkpoint json.RawMessage
 	Tags       json.RawMessage
 	Payload    json.RawMessage
+	LeaseToken uint64
 }
 
 // Frame represents a message received from the server in the message loop.
@@ -796,7 +799,10 @@ func (c *Conn) SendFail(jobs []FailJob) error {
 	estSize := 2
 	for i := range jobs {
 		j := &jobs[i]
-		estSize += 1 + len(j.JobID) + 1 + len(j.Queue) + 1 + len(j.Error) + 1 + len(j.Backtrace)
+		estSize += 1 + len(j.JobID) + 1 + len(j.Queue) + 1 + len(j.Error) + 1 + len(j.Backtrace) + 1 // +1 for flags byte
+		if j.LeaseToken != 0 {
+			estSize += 8
+		}
 	}
 
 	buf := make([]byte, estSize)
@@ -811,6 +817,17 @@ func (c *Conn) SendFail(jobs []FailJob) error {
 		off = putLenPrefixed(buf, off, j.Queue)
 		off = putLenPrefixed(buf, off, j.Error)
 		off = putLenPrefixed(buf, off, j.Backtrace)
+
+		var flags uint8
+		if j.LeaseToken != 0 {
+			flags |= 0x01
+		}
+		buf[off] = flags
+		off++
+		if flags&0x01 != 0 {
+			binary.LittleEndian.PutUint64(buf[off:], j.LeaseToken)
+			off += 8
+		}
 	}
 
 	return c.sendOnly(msgFailBatch, buf[:off])
@@ -859,7 +876,7 @@ func (c *Conn) Cancel(jobIDs []string) (int, error) {
 //
 // Response: [count:u16] per job: [id:lenPrefixed][queue:lenPrefixed][attempt:u16][max_retries:u16]
 //
-//	[checkpoint:lenPrefixed][tags:lenPrefixed][payload_len:u16][payload_bytes]
+//	[checkpoint:lenPrefixed][tags:lenPrefixed][payload_len:u16][payload_bytes][lease_token:u64LE]
 func parseFetchResponse(data []byte) ([]FetchedJob, error) {
 	if len(data) < 2 {
 		return nil, nil
@@ -907,6 +924,10 @@ func parseFetchResponse(data []byte) ([]FetchedJob, error) {
 			job.Payload = json.RawMessage(payload)
 		}
 
+		// Read lease_token (u64 LE).
+		job.LeaseToken = binary.LittleEndian.Uint64(data[off:])
+		off += 8
+
 		jobs[i] = job
 	}
 
@@ -921,6 +942,7 @@ func parseFetchResponse(data []byte) ([]FetchedJob, error) {
 //	if flags & 0x01: [result:lenPrefixed]
 //	if flags & 0x02: [checkpoint:lenPrefixed]
 //	if flags & 0x04: [hold_reason:lenPrefixed]
+//	if flags & 0x08: [lease_token:u64LE]
 func encodeAckSection(buf []byte, off int, acks []AckJob) int {
 	for i := range acks {
 		a := &acks[i]
@@ -939,6 +961,9 @@ func encodeAckSection(buf []byte, off int, acks []AckJob) int {
 		if a.HoldReason != "" {
 			flags |= 0x04
 		}
+		if a.LeaseToken != 0 {
+			flags |= 0x08
+		}
 		buf[off] = flags
 		off++
 
@@ -950,6 +975,10 @@ func encodeAckSection(buf []byte, off int, acks []AckJob) int {
 		}
 		if flags&0x04 != 0 {
 			off = putLenPrefixed(buf, off, a.HoldReason)
+		}
+		if flags&0x08 != 0 {
+			binary.LittleEndian.PutUint64(buf[off:], a.LeaseToken)
+			off += 8
 		}
 	}
 	return off
@@ -970,6 +999,9 @@ func ackSectionSize(acks []AckJob) int {
 		if a.HoldReason != "" {
 			n += 1 + len(a.HoldReason)
 		}
+		if a.LeaseToken != 0 {
+			n += 8
+		}
 	}
 	return n
 }
@@ -983,6 +1015,7 @@ func ackSectionSize(acks []AckJob) int {
 //	         if flags & 0x01: [result:lenPrefixed]
 //	         if flags & 0x02: [checkpoint:lenPrefixed]
 //	         if flags & 0x04: [hold_reason:lenPrefixed]
+//	         if flags & 0x08: [lease_token:u64LE]
 func (c *Conn) AckBatch(acks []AckJob) error {
 	count := len(acks)
 	if count == 0 {
@@ -1027,6 +1060,8 @@ func (c *Conn) AckBatch(acks []AckJob) error {
 //
 //	[count:u16]
 //	per job: [id:lenPrefixed][queue:lenPrefixed][error:lenPrefixed][backtrace:lenPrefixed]
+//	         [flags:u8]
+//	         if flags & 0x01: [lease_token:u64LE]
 func (c *Conn) FailBatch(jobs []FailJob) error {
 	count := len(jobs)
 	if count == 0 {
@@ -1040,7 +1075,10 @@ func (c *Conn) FailBatch(jobs []FailJob) error {
 	estSize := 2 // count
 	for i := range jobs {
 		j := &jobs[i]
-		estSize += 1 + len(j.JobID) + 1 + len(j.Queue) + 1 + len(j.Error) + 1 + len(j.Backtrace)
+		estSize += 1 + len(j.JobID) + 1 + len(j.Queue) + 1 + len(j.Error) + 1 + len(j.Backtrace) + 1 // +1 for flags byte
+		if j.LeaseToken != 0 {
+			estSize += 8
+		}
 	}
 
 	buf := make([]byte, estSize)
@@ -1055,6 +1093,17 @@ func (c *Conn) FailBatch(jobs []FailJob) error {
 		off = putLenPrefixed(buf, off, j.Queue)
 		off = putLenPrefixed(buf, off, j.Error)
 		off = putLenPrefixed(buf, off, j.Backtrace)
+
+		var flags uint8
+		if j.LeaseToken != 0 {
+			flags |= 0x01
+		}
+		buf[off] = flags
+		off++
+		if flags&0x01 != 0 {
+			binary.LittleEndian.PutUint64(buf[off:], j.LeaseToken)
+			off += 8
+		}
 	}
 
 	respType, respPayload, err := c.sendAndRecv(msgFailBatch, buf[:off])
