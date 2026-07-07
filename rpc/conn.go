@@ -21,9 +21,11 @@ const (
 	msgFetchBatch   = 0x02
 	msgAckBatch     = 0x03
 	msgPing         = 0x04
+	msgAuth         = 0x05 // Connection auth handshake (client -> server).
 	msgHeartbeat    = 0x06
 	msgFailBatch    = 0x07
 	msgCancelSignal = 0x08 // Cancel signal (server -> client push).
+	msgAuthResp     = 0x85 // Auth handshake result (server -> client).
 
 	// Bulk action request/response.
 	msgBulkAction     = 0x14
@@ -147,23 +149,33 @@ const (
 // It is NOT safe for concurrent use; callers must synchronize externally
 // or use one Conn per goroutine.
 type Conn struct {
-	conn    net.Conn
-	host    string
-	port    int
-	reqID   uint32
-	sendBuf []byte
-	recvBuf []byte
-	mu      sync.Mutex
+	conn      net.Conn
+	host      string
+	port      int
+	authToken string
+	reqID     uint32
+	sendBuf   []byte
+	recvBuf   []byte
+	mu        sync.Mutex
 }
 
 // NewConn creates a new binary RPC connection. It does not connect immediately;
 // the connection is established lazily on the first RPC call.
 func NewConn(host string, port int) *Conn {
+	return NewConnWithAuth(host, port, "")
+}
+
+// NewConnWithAuth creates a connection that authenticates with the given token
+// (an API key or the admin password) via the MSG_AUTH handshake immediately
+// after each (re)connect. Required when the server is started with an admin
+// password; leave empty otherwise.
+func NewConnWithAuth(host string, port int, authToken string) *Conn {
 	return &Conn{
-		host:    host,
-		port:    port,
-		sendBuf: make([]byte, bufSize),
-		recvBuf: make([]byte, bufSize),
+		host:      host,
+		port:      port,
+		authToken: authToken,
+		sendBuf:   make([]byte, bufSize),
+		recvBuf:   make([]byte, bufSize),
 	}
 }
 
@@ -193,6 +205,56 @@ func (c *Conn) connect() error {
 		return fmt.Errorf("set TCP_NODELAY: %w", err)
 	}
 	c.conn = conn
+
+	// Authenticate before any other frame if a token is configured. Servers
+	// started with an admin password gate the connection until this succeeds.
+	if c.authToken != "" {
+		if err := c.authenticate(); err != nil {
+			c.conn.Close()
+			c.conn = nil
+			return err
+		}
+	}
+	return nil
+}
+
+// authenticate performs the MSG_AUTH handshake on the freshly-opened connection.
+// Wire: send [status frame] MSG_AUTH with payload [token:lenPrefixed]; read
+// MSG_AUTH_RESP with payload [status:u8 (0=ok)][role:u8].
+func (c *Conn) authenticate() error {
+	token := c.authToken
+	if len(token) > 255 {
+		token = token[:255]
+	}
+	payload := make([]byte, 1+len(token))
+	payload[0] = byte(len(token))
+	copy(payload[1:], token)
+
+	frame := make([]byte, headerSize+len(payload))
+	writeHeader(frame, msgAuth, c.nextReqID(), uint32(len(payload)))
+	copy(frame[headerSize:], payload)
+	if _, err := c.conn.Write(frame); err != nil {
+		return fmt.Errorf("auth write: %w", err)
+	}
+
+	if _, err := io.ReadFull(c.conn, c.recvBuf[:headerSize]); err != nil {
+		return fmt.Errorf("auth read header: %w", err)
+	}
+	respType := c.recvBuf[0]
+	respLen := binary.LittleEndian.Uint32(c.recvBuf[5:9])
+	var resp []byte
+	if respLen > 0 {
+		resp = make([]byte, respLen)
+		if _, err := io.ReadFull(c.conn, resp); err != nil {
+			return fmt.Errorf("auth read payload: %w", err)
+		}
+	}
+	if respType != msgAuthResp {
+		return fmt.Errorf("unexpected auth response type 0x%02x", respType)
+	}
+	if len(resp) < 1 || resp[0] != 0 {
+		return &ServerError{Message: "authentication failed"}
+	}
 	return nil
 }
 

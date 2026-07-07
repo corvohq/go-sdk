@@ -41,6 +41,9 @@ type PoolOptions struct {
 	// Management operations (search, queues, bulk, etc.) still use HTTP.
 	RPCHost string
 	RPCPort int
+	// RPCAuthToken authenticates RPC connections (API key or admin password).
+	// Required when the server is started with an admin password.
+	RPCAuthToken string
 }
 
 func (o *PoolOptions) defaults() {
@@ -267,7 +270,7 @@ func NewPooledClient(opts PoolOptions) *PooledClient {
 	if opts.RPCHost != "" && opts.RPCPort > 0 {
 		conns = make([]*rpc.Conn, opts.Lanes)
 		for i := range opts.Lanes {
-			conns[i] = rpc.NewConn(opts.RPCHost, opts.RPCPort)
+			conns[i] = rpc.NewConnWithAuth(opts.RPCHost, opts.RPCPort, opts.RPCAuthToken)
 		}
 	}
 
