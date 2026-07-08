@@ -13,7 +13,7 @@ import (
 
 // Wire protocol constants.
 const (
-	headerSize = 9  // msg_type(1) + req_id(4) + payload_len(4)
+	headerSize = 9     // msg_type(1) + req_id(4) + payload_len(4)
 	bufSize    = 65536 // 64KB send/recv buffers
 
 	// Request message types.
@@ -25,6 +25,7 @@ const (
 	msgHeartbeat    = 0x06
 	msgFailBatch    = 0x07
 	msgCancelSignal = 0x08 // Cancel signal (server -> client push).
+	msgNotLeader    = 0x09 // Leader step-down (server -> client push); re-subscribe.
 	msgAuthResp     = 0x85 // Auth handshake result (server -> client).
 
 	// Bulk action request/response.
@@ -338,6 +339,11 @@ func readLenPrefixedBytes(buf []byte, off int) ([]byte, int) {
 // This is a protocol-level error, not an I/O error, and does not trigger reconnect.
 type ServerError struct {
 	Message string
+	// Retryable is set when the error arrived on a fetch-subscription path: the
+	// server rejected the subscribe (e.g. it is at connection capacity) or a
+	// leader step-down displaced the subscription. The subscribe loop should
+	// back off and re-subscribe rather than treat it as fatal.
+	Retryable bool
 }
 
 func (e *ServerError) Error() string {
@@ -756,12 +762,20 @@ func (c *Conn) ReadPushedJobs() ([]FetchedJob, error) {
 		return nil, err
 	}
 
+	if msgType == msgNotLeader {
+		// A leader step-down displaced this subscription. Not fatal: the caller
+		// should back off and re-subscribe (leader redirect is out of scope).
+		return nil, &ServerError{Message: "not leader", Retryable: true}
+	}
+
 	if msgType == msgError {
+		// An error frame on the subscribe path is a retry-later rejection (the
+		// server is at connection capacity); back off and re-subscribe.
 		errMsg := "server error"
 		if len(payload) > 0 {
 			errMsg = string(payload)
 		}
-		return nil, &ServerError{Message: errMsg}
+		return nil, &ServerError{Message: errMsg, Retryable: true}
 	}
 
 	if msgType != msgFetchBatchResp {
@@ -819,11 +833,18 @@ func (c *Conn) ReadFrame() (Frame, error) {
 		return Frame{Type: FramePong}, nil
 
 	case msgError:
+		// On the subscribe path an error frame is a retry-later rejection
+		// (server at connection capacity); back off and re-subscribe.
 		errMsg := "server error"
 		if len(payload) > 0 {
 			errMsg = string(payload)
 		}
-		return Frame{Type: FrameError}, &ServerError{Message: errMsg}
+		return Frame{Type: FrameError}, &ServerError{Message: errMsg, Retryable: true}
+
+	case msgNotLeader:
+		// A leader step-down displaced this subscription. Not fatal: the caller
+		// should back off and re-subscribe (leader redirect is out of scope).
+		return Frame{Type: FrameError}, &ServerError{Message: "not leader", Retryable: true}
 
 	default:
 		return Frame{}, fmt.Errorf("unexpected message type 0x%02x", msgType)
@@ -938,7 +959,7 @@ func (c *Conn) Cancel(jobIDs []string) (int, error) {
 //
 // Response: [count:u16] per job: [id:lenPrefixed][queue:lenPrefixed][attempt:u16][max_retries:u16]
 //
-//	[checkpoint:lenPrefixed][tags:lenPrefixed][payload_len:u16][payload_bytes][lease_token:u64LE]
+//	[checkpoint:lenPrefixed][tags:lenPrefixed][payload_len:u32][payload_bytes][lease_token:u64LE]
 func parseFetchResponse(data []byte) ([]FetchedJob, error) {
 	if len(data) < 2 {
 		return nil, nil
@@ -977,8 +998,10 @@ func parseFetchResponse(data []byte) ([]FetchedJob, error) {
 			job.Tags = json.RawMessage(tags)
 		}
 
-		payloadLen := int(binary.LittleEndian.Uint16(data[off:]))
-		off += 2
+		// payload_len is a u32: the server's max payload is 256 KiB and its
+		// default max is exactly 65536, both of which exceed u16's 65535 cap.
+		payloadLen := int(binary.LittleEndian.Uint32(data[off:]))
+		off += 4
 		payload := make([]byte, payloadLen)
 		copy(payload, data[off:off+payloadLen])
 		off += payloadLen

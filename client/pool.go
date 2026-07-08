@@ -3,12 +3,21 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/corvohq/go-sdk/rpc"
+)
+
+// Fetch-subscription retry tuning. When the server rejects a subscribe with a
+// retryable error (it is at connection capacity, or a leader step-down
+// displaced the subscription), FetchRPC backs off and re-subscribes.
+const (
+	subscribeRetryBackoff = time.Second // delay before re-subscribing
+	subscribeMaxRetries   = 3           // bound so a saturated server can't hang the loop forever
 )
 
 // PooledClient wraps N internal HTTP clients (lanes) for connection pooling
@@ -60,16 +69,16 @@ func (o *PoolOptions) defaults() {
 
 // EnqueueRequest describes a single job to enqueue via the pooled client.
 type EnqueueRequest struct {
-	Queue       string
-	Payload     interface{}
-	Priority    *string
-	MaxRetries  *int
-	UniqueKey   *string
+	Queue        string
+	Payload      interface{}
+	Priority     *string
+	MaxRetries   *int
+	UniqueKey    *string
 	UniquePeriod *int
-	Tags        map[string]string
-	ScheduledAt *time.Time
-	ExpireAfter *time.Duration
-	BatchID     *string
+	Tags         map[string]string
+	ScheduledAt  *time.Time
+	ExpireAfter  *time.Duration
+	BatchID      *string
 }
 
 // enqueueEntry is an in-flight enqueue waiting to be flushed.
@@ -342,17 +351,37 @@ func (p *PooledClient) EnqueueRPC(jobs []rpc.EnqueueJob) (int, error) {
 }
 
 // FetchRPC subscribes and blocks until jobs are pushed by the server.
-// Internally it sends a subscribe with the given credits, then reads
-// the pushed response. This is a blocking call.
+// Internally it sends a subscribe with the given credits, then reads the
+// pushed response. If the server rejects the subscribe or a leader step-down
+// displaces the subscription (a retryable rpc.ServerError), it backs off and
+// re-subscribes up to subscribeMaxRetries times before surfacing the error.
+// This is a blocking call.
 func (p *PooledClient) FetchRPC(queues []string, workerID string, count int) ([]rpc.FetchedJob, error) {
 	conn := p.pickConn()
 	if conn == nil {
 		return nil, fmt.Errorf("binary RPC not configured")
 	}
-	if err := conn.Subscribe(queues, workerID, count); err != nil {
+
+	var lastErr error
+	for attempt := 0; attempt <= subscribeMaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(subscribeRetryBackoff)
+		}
+		if err := conn.Subscribe(queues, workerID, count); err != nil {
+			return nil, err
+		}
+		jobs, err := conn.ReadPushedJobs()
+		if err == nil {
+			return jobs, nil
+		}
+		var serverErr *rpc.ServerError
+		if errors.As(err, &serverErr) && serverErr.Retryable {
+			lastErr = err
+			continue
+		}
 		return nil, err
 	}
-	return conn.ReadPushedJobs()
+	return nil, lastErr
 }
 
 // AckRPC acknowledges a batch of jobs using the binary RPC connection.

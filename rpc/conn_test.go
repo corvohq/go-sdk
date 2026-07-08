@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -112,7 +113,7 @@ func TestEnqueueBatch(t *testing.T) {
 		off++
 		maxRetries1 := binary.LittleEndian.Uint16(payload[off:])
 		off += 2
-		off++ // backoff
+		off++    // backoff
 		off += 4 // base_delay_ms
 		off += 4 // max_delay_ms
 		off += 4 // unique_period_s
@@ -190,15 +191,15 @@ func TestEnqueueBatchWithPayload(t *testing.T) {
 		// queue, id
 		_, off = readLenPrefixed(payload, off)
 		_, off = readLenPrefixed(payload, off)
-		off++     // priority
-		off += 2  // max_retries
-		off++     // backoff
-		off += 4  // base_delay_ms
-		off += 4  // max_delay_ms
-		off += 4  // unique_period_s
-		off += 8  // scheduled_at_ns
-		off += 4  // expire_after_ms
-		off += 2  // chain_step
+		off++    // priority
+		off += 2 // max_retries
+		off++    // backoff
+		off += 4 // base_delay_ms
+		off += 4 // max_delay_ms
+		off += 4 // unique_period_s
+		off += 8 // scheduled_at_ns
+		off += 4 // expire_after_ms
+		off += 2 // chain_step
 		flags := binary.LittleEndian.Uint16(payload[off:])
 		off += 2
 
@@ -272,16 +273,16 @@ func TestSubscribeAndReadPushedJobs(t *testing.T) {
 		roff += 2
 
 		roff = putLenPrefixed(resp, roff, "job-123")  // id
-		roff = putLenPrefixed(resp, roff, "default")   // queue
-		binary.LittleEndian.PutUint16(resp[roff:], 1)  // attempt
+		roff = putLenPrefixed(resp, roff, "default")  // queue
+		binary.LittleEndian.PutUint16(resp[roff:], 1) // attempt
 		roff += 2
-		binary.LittleEndian.PutUint16(resp[roff:], 3)  // max_retries
+		binary.LittleEndian.PutUint16(resp[roff:], 3) // max_retries
 		roff += 2
-		roff = putLenPrefixedBytes(resp, roff, nil)    // checkpoint
-		roff = putLenPrefixedBytes(resp, roff, nil)    // tags
+		roff = putLenPrefixedBytes(resp, roff, nil) // checkpoint
+		roff = putLenPrefixedBytes(resp, roff, nil) // tags
 		payloadBytes := []byte(`{"key":"value"}`)
-		binary.LittleEndian.PutUint16(resp[roff:], uint16(len(payloadBytes)))
-		roff += 2
+		binary.LittleEndian.PutUint32(resp[roff:], uint32(len(payloadBytes))) // payload_len (u32)
+		roff += 4
 		copy(resp[roff:], payloadBytes)
 		roff += len(payloadBytes)
 		binary.LittleEndian.PutUint64(resp[roff:], 0xDEADBEEF42) // lease_token
@@ -738,11 +739,11 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	off += 2
 	binary.LittleEndian.PutUint16(buf[off:], 3) // max_retries
 	off += 2
-	off = putLenPrefixedBytes(buf, off, []byte(`{"step":1}`)) // checkpoint
+	off = putLenPrefixedBytes(buf, off, []byte(`{"step":1}`))     // checkpoint
 	off = putLenPrefixedBytes(buf, off, []byte(`{"env":"prod"}`)) // tags
 	p1 := []byte(`{"action":"build"}`)
-	binary.LittleEndian.PutUint16(buf[off:], uint16(len(p1)))
-	off += 2
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(p1))) // payload_len (u32)
+	off += 4
 	copy(buf[off:], p1)
 	off += len(p1)
 	binary.LittleEndian.PutUint64(buf[off:], 111) // lease_token
@@ -751,14 +752,14 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	// Job 2.
 	off = putLenPrefixed(buf, off, "j2")
 	off = putLenPrefixed(buf, off, "q2")
-	binary.LittleEndian.PutUint16(buf[off:], 4)  // attempt
+	binary.LittleEndian.PutUint16(buf[off:], 4) // attempt
 	off += 2
 	binary.LittleEndian.PutUint16(buf[off:], 10) // max_retries
 	off += 2
-	off = putLenPrefixedBytes(buf, off, nil) // no checkpoint
-	off = putLenPrefixedBytes(buf, off, nil) // no tags
-	binary.LittleEndian.PutUint16(buf[off:], 0)  // no payload
-	off += 2
+	off = putLenPrefixedBytes(buf, off, nil)    // no checkpoint
+	off = putLenPrefixedBytes(buf, off, nil)    // no tags
+	binary.LittleEndian.PutUint32(buf[off:], 0) // no payload (payload_len u32)
+	off += 4
 	binary.LittleEndian.PutUint64(buf[off:], 222) // lease_token
 	off += 8
 
@@ -805,5 +806,138 @@ func TestParseFetchResponseMultipleJobs(t *testing.T) {
 	}
 	if jobs[1].LeaseToken != 222 {
 		t.Errorf("job[1].LeaseToken = %d, want 222", jobs[1].LeaseToken)
+	}
+}
+
+// TestReadPushedJobsLargePayload proves a fetch response carrying a payload of
+// exactly 65536 bytes decodes end-to-end. That size is the server's default max
+// payload and one byte beyond what the old u16 payload_len could represent
+// (65535). The frame it rides in is also larger than the connection's 64KiB
+// recv buffer, so this exercises readFrame's allocate-on-overflow path too.
+func TestReadPushedJobsLargePayload(t *testing.T) {
+	const payloadSize = 65536
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i) // deterministic, wraps every 256 bytes
+	}
+
+	host, port, cleanup := mockServer(t, func(conn net.Conn) {
+		msgType, reqID, _ := readFrame(t, conn)
+		if msgType != msgFetchBatch {
+			t.Errorf("expected msgFetchBatch, got 0x%02x", msgType)
+		}
+
+		resp := make([]byte, 128+payloadSize)
+		roff := 0
+		binary.LittleEndian.PutUint16(resp[roff:], 1) // count
+		roff += 2
+		roff = putLenPrefixed(resp, roff, "big-1")    // id
+		roff = putLenPrefixed(resp, roff, "default")  // queue
+		binary.LittleEndian.PutUint16(resp[roff:], 1) // attempt
+		roff += 2
+		binary.LittleEndian.PutUint16(resp[roff:], 5) // max_retries
+		roff += 2
+		roff = putLenPrefixedBytes(resp, roff, nil)                     // checkpoint
+		roff = putLenPrefixedBytes(resp, roff, nil)                     // tags
+		binary.LittleEndian.PutUint32(resp[roff:], uint32(payloadSize)) // payload_len (u32)
+		roff += 4
+		copy(resp[roff:], payload)
+		roff += payloadSize
+		binary.LittleEndian.PutUint64(resp[roff:], 0xABCDEF) // lease_token
+		roff += 8
+
+		writeFrame(t, conn, msgFetchBatchResp, reqID, resp[:roff])
+	})
+	defer cleanup()
+
+	c := NewConn(host, port)
+	defer c.Close()
+
+	if err := c.Subscribe([]string{"default"}, "w1", 1); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+	jobs, err := c.ReadPushedJobs()
+	if err != nil {
+		t.Fatalf("ReadPushedJobs failed: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if len(jobs[0].Payload) != payloadSize {
+		t.Fatalf("payload len = %d, want %d", len(jobs[0].Payload), payloadSize)
+	}
+	if !bytes.Equal(jobs[0].Payload, payload) {
+		t.Errorf("payload bytes did not round-trip")
+	}
+	if jobs[0].LeaseToken != 0xABCDEF {
+		t.Errorf("lease_token = 0x%x, want 0xABCDEF", jobs[0].LeaseToken)
+	}
+}
+
+// TestReadPushedJobsSubscribeRejectedRetryable proves that a MSG_ERROR frame
+// received in response to a fetch subscribe surfaces as a retryable ServerError
+// so the subscribe loop backs off and re-subscribes instead of failing fatally.
+func TestReadPushedJobsSubscribeRejectedRetryable(t *testing.T) {
+	const rejectMsg = "subscription rejected: server at connection capacity"
+	host, port, cleanup := mockServer(t, func(conn net.Conn) {
+		_, reqID, _ := readFrame(t, conn)
+		writeFrame(t, conn, msgError, reqID, []byte(rejectMsg))
+	})
+	defer cleanup()
+
+	c := NewConn(host, port)
+	defer c.Close()
+
+	if err := c.Subscribe([]string{"default"}, "w1", 1); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+	_, err := c.ReadPushedJobs()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var serverErr *ServerError
+	if !errors.As(err, &serverErr) {
+		t.Fatalf("expected *ServerError, got %T: %v", err, err)
+	}
+	if !serverErr.Retryable {
+		t.Error("ServerError.Retryable = false, want true (subscribe rejection must be retryable)")
+	}
+	if serverErr.Message != rejectMsg {
+		t.Errorf("ServerError.Message = %q, want %q", serverErr.Message, rejectMsg)
+	}
+}
+
+// TestReadFrameNotLeaderRetryable proves that a MSG_NOT_LEADER (0x09) push to an
+// already-subscribed connection (a leader step-down) does not crash the read
+// loop or hit the fatal "unexpected message type" path — it surfaces as a
+// retryable ServerError so the caller can re-subscribe. Leader redirect is out
+// of scope; the leader-hint payload is not parsed.
+func TestReadFrameNotLeaderRetryable(t *testing.T) {
+	host, port, cleanup := mockServer(t, func(conn net.Conn) {
+		_, reqID, _ := readFrame(t, conn)
+		// Leader-hint payload: [id:lenPrefixed][addr:lenPrefixed] — binary, not UTF-8.
+		writeFrame(t, conn, msgNotLeader, reqID, []byte{0x02, 'n', '1', 0x00})
+	})
+	defer cleanup()
+
+	c := NewConn(host, port)
+	defer c.Close()
+
+	if err := c.Subscribe([]string{"default"}, "w1", 1); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+	frame, err := c.ReadFrame()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if frame.Type != FrameError {
+		t.Errorf("frame.Type = %d, want FrameError (%d)", frame.Type, FrameError)
+	}
+	var serverErr *ServerError
+	if !errors.As(err, &serverErr) {
+		t.Fatalf("expected *ServerError, got %T: %v", err, err)
+	}
+	if !serverErr.Retryable {
+		t.Error("ServerError.Retryable = false, want true (not-leader must be retryable)")
 	}
 }
